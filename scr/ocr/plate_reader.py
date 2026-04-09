@@ -1,120 +1,185 @@
-import easyocr
+"""
+PlateReader — đọc và xác thực biển số xe Việt Nam.
+
+Hỗ trợ:
+- PaddleOCR (ưu tiên, tốt hơn cho tiếng Việt)
+- EasyOCR (fallback)
+
+Xử lý các loại biển:
+- Biển chuẩn:   29A-1234
+- Biển cũ:      29-BN-001
+- Biển ngoại giao: CC/CD + số
+- Biển xin số:  XIN SỐ / XS / PENDING
+"""
+
+import re
 import cv2
 import numpy as np
-import re
+from collections import Counter
+from typing import Dict, Tuple, Optional
+
 import config
 
+# Chọn engine OCR
+try:
+    from paddleocr import PaddleOCR
+    _USE_PADDLE = True
+except ImportError:
+    import easyocr
+    _USE_PADDLE = False
+
+# Mã tỉnh hợp lệ
+VALID_PROVINCES = {
+    '01', '02', '03', '04', '05', '06', '07', '08', '09', '10',
+    '11', '12', '13', '14', '15', '16', '17', '18', '19', '20',
+    '21', '22', '23', '24', '25', '26', '27', '28', '29', '30',
+    '31', '32', '33', '34', '35', '36', '37', '38', '39', '40',
+    '41', '42', '43', '44', '45', '46', '47', '48', '49', '50',
+    '51', '52', '99',
+}
+
+# Regex các dạng biển
+_PATTERNS = {
+    'standard':   re.compile(r'^\d{2}[A-Z]{1,2}\d{4,5}$'),
+    'old_format': re.compile(r'^\d{2}-[A-Z]{2}-\d{3,5}$'),
+    'diplomatic': re.compile(r'^[A-Z]{2}\d+$'),
+    'temporary':  re.compile(r'(XIN\s*S[ÔO]|XS|PENDING)', re.IGNORECASE),
+}
+
+# Lỗi OCR thường gặp (chỉ áp dụng cho phần số phía sau chữ cái)
+_OCR_CORRECTIONS = {'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '9'}
+
+
+def _preprocess(plate_img: np.ndarray) -> np.ndarray:
+    """Tiền xử lý ảnh biển số để tăng độ chính xác OCR."""
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY) if len(plate_img.shape) == 3 else plate_img
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+
+    if config.OCR_RESIZE_WIDTH > 0:
+        h, w = gray.shape
+        gray = cv2.resize(gray, (config.OCR_RESIZE_WIDTH, int(h * config.OCR_RESIZE_WIDTH / w)))
+
+    return gray
+
+
+def _classify(text: str) -> str:
+    """Phân loại biển số theo nội dung."""
+    if not text:
+        return 'EMPTY'
+    if _PATTERNS['temporary'].search(text):
+        return 'TEMPORARY'
+    if _PATTERNS['standard'].match(text):
+        return 'STANDARD'
+    if _PATTERNS['old_format'].match(text):
+        return 'OLD_FORMAT'
+    if _PATTERNS['diplomatic'].match(text):
+        return 'DIPLOMATIC'
+    return 'UNKNOWN'
+
+
+def _is_valid(text: str) -> bool:
+    """Kiểm tra biển số có hợp lệ không."""
+    if not text or len(text) < 5:
+        return False
+    has_digit = any(c.isdigit() for c in text)
+    has_alpha = any(c.isalpha() for c in text)
+    return has_digit and has_alpha
+
+
+def _correct_text(text: str) -> str:
+    """Sửa lỗi OCR phổ biến."""
+    if _is_valid(text):
+        return text
+    corrected = text.translate(str.maketrans(_OCR_CORRECTIONS))
+    return corrected if _is_valid(corrected) else text
+
+
 class PlateReader:
-    def __init__(self, lang_list=['en', 'vi'], gpu=False):
-        """
-        ✨ ENHANCED: OCR reader with GPU support
-        
-        Args:
-            lang_list: Languages to recognize (English + Vietnamese)
-            gpu: Enable GPU acceleration if available
-        """
-        self.reader = easyocr.Reader(lang_list, gpu=gpu)
-        self.conf_thresh = config.OCR_CONF_THRESH
+    """Đọc biển số xe Việt Nam từ ảnh crop."""
 
-    def preprocess_image(self, plate_img):
-        """
-        ✨ NEW: Preprocess plate image for better OCR
-        
-        Techniques:
-        - Convert to grayscale
-        - Enhance contrast with CLAHE
-        - Resize for consistency
-        """
-        # Convert to grayscale if needed
-        if config.OCR_GRAYSCALE:
-            if len(plate_img.shape) == 3:
-                gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = plate_img
-        else:
-            gray = plate_img
-        
-        # ✨ NEW: Enhance contrast using CLAHE
-        if config.OCR_ENHANCE:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            gray = clahe.apply(gray)
-        
-        # ✨ NEW: Resize to standard width
-        h, w = gray.shape[:2]
-        if config.OCR_RESIZE_WIDTH > 0:
-            scale = config.OCR_RESIZE_WIDTH / w
-            new_h = int(h * scale)
-            gray = cv2.resize(gray, (config.OCR_RESIZE_WIDTH, new_h))
-        
-        return gray
+    def __init__(self, use_gpu: bool = False):
+        self.conf_thresh = getattr(config, 'OCR_CONF_THRESH', 0.45)
+        self.use_gpu = use_gpu
 
-    def read(self, plate_img):
-        """
-        ✨ ENHANCED: OCR with preprocessing and validation
-        
-        Returns: (text, confidence)
-        """
-        # ✨ NEW: Preprocess image
-        processed = self.preprocess_image(plate_img)
-        
-        # ✨ NEW: Convert to RGB for EasyOCR
-        if len(processed.shape) == 2:
-            rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+        if _USE_PADDLE:
+            self._ocr = PaddleOCR(use_angle_cls=True, lang='ch', use_gpu=use_gpu)
+            self.engine = "PaddleOCR"
         else:
-            rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-        
-        # ✨ NEW: OCR with detailed results
-        results = self.reader.readtext(rgb, detail=1)
-        
-        if not results:
+            self._ocr = easyocr.Reader(['en', 'vi'], gpu=use_gpu)
+            self.engine = "EasyOCR"
+
+    def read(self, plate_img: np.ndarray) -> Tuple[str, float]:
+        """
+        Đọc biển số từ ảnh.
+        Trả về: (text, confidence)
+        """
+        if plate_img.size == 0:
             return "", 0.0
-        
-        # ✨ NEW: Enhanced aggregation
-        best_text = ""
-        best_conf = 0.0
-        all_texts = []
-        
-        for (bbox, text, conf) in results:
-            # Only keep high-confidence characters
-            if conf > self.conf_thresh:
-                all_texts.append(text)
-                if conf > best_conf:
-                    best_conf = conf
-        
-        # ✨ NEW: Join all texts
-        best_text = "".join(all_texts)
-        
-        # ✨ NEW: Validate plate format
-        best_text = self.validate_plate_format(best_text)
-        
-        return best_text, best_conf
 
-    def validate_plate_format(self, text):
+        processed = _preprocess(plate_img)
+
+        if _USE_PADDLE:
+            text, conf = self._read_paddle(processed)
+        else:
+            text, conf = self._read_easyocr(processed)
+
+        text = _correct_text(text)
+        return text, conf
+
+    def read_with_info(self, plate_img: np.ndarray) -> Dict:
         """
-        ✨ NEW: Validate and clean OCR text
-        
-        Vietnamese plates format: 
-        - Pattern: XX[A-Z]{1,2}[0-9]{4} (e.g., 29A1234)
+        Đọc biển số và trả về thông tin đầy đủ.
+        Trả về: {'text', 'confidence', 'type', 'is_valid', 'engine'}
         """
-        # Remove spaces
-        text = text.replace(" ", "").upper()
-        
-        # Vietnamese plate pattern: 2-3 digits, 1-2 letters, 4-5 digits
-        pattern = r'^(\d{2,3})([A-Z]{1,2})(\d{4,5})$'
-        
-        match = re.match(pattern, text)
-        if match:
-            return text
-        
-        # If no match, try to salvage by removing invalid chars
-        # Keep only digits and letters
-        cleaned = "".join(c for c in text if c.isalnum())
-        
-        # Check if it looks like a plate (has mix of letters and numbers)
-        has_digits = any(c.isdigit() for c in cleaned)
-        has_letters = any(c.isalpha() for c in cleaned)
-        
-        if has_digits and has_letters and len(cleaned) >= 6:
-            return cleaned
-        
-        return text  # Return as-is if can't validate
+        text, conf = self.read(plate_img)
+        plate_type = _classify(text)
+
+        return {
+            'text': text,
+            'confidence': conf,
+            'type': plate_type,
+            'is_valid': _is_valid(text),
+            'engine': self.engine,
+        }
+
+    def _read_paddle(self, processed: np.ndarray) -> Tuple[str, float]:
+        img = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+        result = self._ocr.ocr(img, cls=True)
+
+        if not result or not result[0]:
+            return "", 0.0
+
+        texts, confs = [], []
+        for line in result[0]:
+            text, conf = line[1]
+            if conf > self.conf_thresh:
+                cleaned = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
+                if cleaned:
+                    texts.append(cleaned)
+                    confs.append(conf)
+
+        return "".join(texts), float(np.mean(confs)) if confs else 0.0
+
+    def _read_easyocr(self, processed: np.ndarray) -> Tuple[str, float]:
+        rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+        result = self._ocr.readtext(rgb, detail=1)
+
+        if not result:
+            return "", 0.0
+
+        texts, confs = [], []
+        for (_, text, conf) in result:
+            if conf > self.conf_thresh:
+                cleaned = re.sub(r'[^A-Z0-9]', '', text.strip().upper())
+                if cleaned:
+                    texts.append(cleaned)
+                    confs.append(conf)
+
+        return "".join(texts), float(np.mean(confs)) if confs else 0.0
