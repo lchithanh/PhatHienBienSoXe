@@ -1,0 +1,21 @@
+# Core dependencies for License Plate Detection
+ultralytics>=8.0.0                # YOLOv8
+torch>=2.0.0                      # PyTorch (auto-install từ ultralytics)
+torchvision>=0.15.0
+
+# Vision & Image Processing
+opencv-python>=4.8.0              # Computer Vision
+
+# Data Processing
+numpy>=1.24.0                     # Numerical computing
+pandas>=2.0.0                     # Data handling
+
+# OCR - Nhẹ, hỗ trợ tiếng Việt
+easyocr>=1.7.0
+
+# Utilities
+python-dotenv>=1.0.0              # Environment variables
+roboflow>=1.1.0                   # Dataset download (optional)
+
+# GUI (nếu dùng detect_gui.py)
+# Tkinter là built-in, không cần install

@@ -1,0 +1,12 @@
+names:
+- License_Plate
+nc: 1
+roboflow:
+  license: CC BY 4.0
+  project: license-plate-recognition-rxg4e-urbwk
+  url: https://app.roboflow.com/ls-workspace-pdyii/license-plate-recognition-rxg4e-urbwk/3
+  version: 3
+  workspace: ls-workspace-pdyii
+test: ../test/images
+train: ../train/images
+val: ../valid/images
